@@ -3,10 +3,15 @@ package com.example.hoverquickmove;
 import com.mojang.blaze3d.platform.InputConstants;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
+import net.fabricmc.fabric.api.client.rendering.v1.hud.VanillaHudElements;
 import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
 import net.minecraft.client.gui.screens.inventory.CreativeModeInventoryScreen;
+import net.minecraft.resources.Identifier;
 import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.inventory.ResultSlot;
 import net.minecraft.world.inventory.Slot;
@@ -23,35 +28,51 @@ import java.util.Properties;
  * (inventory, chest, shulker box, furnace ...), just moving the mouse over an item shift-clicks it,
  * sending it to the other side, with no clicking needed.
  *
+ * It is checked every rendered frame (and every tick as a backup), so items move the instant
+ * the cursor touches them, exactly like a shift-click.
+ *
  * Settings live in config/hoverquickmove.properties (created on first launch):
- *   key        = TAB, LALT, LCONTROL, CAPSLOCK, SPACE, or a single letter such as X  (default TAB)
- *   delayTicks = game ticks to wait between moves, 20 ticks = 1 second (default 2)
+ *   key     = TAB, LALT, LCONTROL, CAPSLOCK, SPACE, or a single letter such as X  (default TAB)
+ *   delayMs = minimum milliseconds between moves, 0 = as fast as possible (default 0)
  * The file is re-read automatically every couple of seconds.
  */
 public class HoverQuickMoveClient implements ClientModInitializer {
     private static int keyCode = InputConstants.KEY_TAB;
-    private static int delayTicks = 2;
+    private static long delayMs = 0;
     private static Path configPath;
     private static long configModified = -1;
     private static long lastConfigCheck = 0;
-    private static int cooldown = 0;
+    private static long lastMoveNanos = 0;
 
     @Override
     public void onInitializeClient() {
         configPath = FabricLoader.getInstance().getConfigDir().resolve("hoverquickmove.properties");
         loadConfig();
-        ClientTickEvents.END_CLIENT_TICK.register(HoverQuickMoveClient::tick);
+
+        // every rendered frame: this is what makes it feel instant
+        HudElementRegistry.attachElementBefore(
+            VanillaHudElements.CHAT,
+            Identifier.fromNamespaceAndPath("hoverquickmove", "hover_move"),
+            HoverQuickMoveClient::onFrame
+        );
+        // every tick: backup in case frames are not delivered while a screen is open
+        ClientTickEvents.END_CLIENT_TICK.register(HoverQuickMoveClient::tryMove);
     }
 
-    private static void tick(Minecraft mc) {
+    private static void onFrame(GuiGraphicsExtractor g, DeltaTracker delta) {
+        tryMove(Minecraft.getInstance());
+    }
+
+    private static void tryMove(Minecraft mc) {
         reloadIfChanged();
-        if (cooldown > 0) cooldown--;
 
         if (mc.player == null || mc.gameMode == null) return;
         if (!(mc.screen instanceof AbstractContainerScreen<?> screen)) return;
         if (screen instanceof CreativeModeInventoryScreen) return;   // creative inventory works differently
         if (!InputConstants.isKeyDown(mc.getWindow(), keyCode)) return;
-        if (cooldown > 0) return;
+
+        long now = System.nanoTime();
+        if (now - lastMoveNanos < delayMs * 1_000_000L) return;
 
         Slot slot = screen.getSlotUnderMouse();
         if (slot == null || !slot.hasItem()) return;
@@ -60,7 +81,7 @@ public class HoverQuickMoveClient implements ClientModInitializer {
         // exactly what shift-clicking the slot does
         mc.gameMode.handleContainerInput(
             screen.getMenu().containerId, slot.index, 0, ContainerInput.QUICK_MOVE, mc.player);
-        cooldown = Math.max(0, delayTicks - 1);
+        lastMoveNanos = now;
     }
 
     private static int keyFromName(String name) {
@@ -86,9 +107,9 @@ public class HoverQuickMoveClient implements ClientModInitializer {
             if (!Files.exists(configPath)) {
                 Properties defaults = new Properties();
                 defaults.setProperty("key", "TAB");
-                defaults.setProperty("delayTicks", "2");
+                defaults.setProperty("delayMs", "0");
                 try (OutputStream out = Files.newOutputStream(configPath)) {
-                    defaults.store(out, "Hover Quick Move. key = TAB, LALT, LCONTROL, CAPSLOCK, SPACE, X, Z, C, V, G, F or Q. delayTicks = ticks between moves (20 ticks = 1 second).");
+                    defaults.store(out, "Hover Quick Move. key = TAB, LALT, LCONTROL, CAPSLOCK, SPACE, X, Z, C, V, G, F or Q. delayMs = minimum milliseconds between moves (0 = instant).");
                 }
             }
             Properties p = new Properties();
@@ -97,9 +118,9 @@ public class HoverQuickMoveClient implements ClientModInitializer {
             }
             keyCode = keyFromName(p.getProperty("key", "TAB"));
             try {
-                delayTicks = Math.max(1, Math.min(40, Integer.parseInt(p.getProperty("delayTicks", "2").trim())));
+                delayMs = Math.max(0, Math.min(1000, Long.parseLong(p.getProperty("delayMs", "0").trim())));
             } catch (NumberFormatException e) {
-                delayTicks = 2;
+                delayMs = 0;
             }
             configModified = Files.getLastModifiedTime(configPath).toMillis();
         } catch (IOException | RuntimeException ignored) {
