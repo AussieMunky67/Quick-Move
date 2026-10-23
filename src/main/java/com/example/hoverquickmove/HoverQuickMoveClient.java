@@ -19,6 +19,7 @@ import net.minecraft.world.inventory.Slot;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Properties;
@@ -67,14 +68,14 @@ public class HoverQuickMoveClient implements ClientModInitializer {
         reloadIfChanged();
 
         if (mc.player == null || mc.gameMode == null) return;
-        if (!(mc.screen instanceof AbstractContainerScreen<?> screen)) return;
+        if (!(mc.gui.screen() instanceof AbstractContainerScreen<?> screen)) return;
         if (screen instanceof CreativeModeInventoryScreen) return;   // creative inventory works differently
         if (!InputConstants.isKeyDown(mc.getWindow(), keyCode)) return;
 
         long now = System.nanoTime();
         if (now - lastMoveNanos < delayMs * 1_000_000L) return;
 
-        Slot slot = screen.getSlotUnderMouse();
+        Slot slot = getHoveredSlot(screen);
         if (slot == null || !slot.hasItem()) return;
         if (slot instanceof ResultSlot) return;   // crafting output: click it yourself so it doesn't spam-craft
 
@@ -82,6 +83,35 @@ public class HoverQuickMoveClient implements ClientModInitializer {
         mc.gameMode.handleContainerInput(
             screen.getMenu().containerId, slot.index, 0, ContainerInput.QUICK_MOVE, mc.player);
         lastMoveNanos = now;
+    }
+
+    private static Field hoveredField;
+    private static boolean hoveredLookupFailed = false;
+
+    /** The slot the mouse is over. Read through reflection because the field is protected. */
+    private static Slot getHoveredSlot(AbstractContainerScreen<?> screen) {
+        if (hoveredLookupFailed) return null;
+        try {
+            if (hoveredField == null) {
+                for (Field f : AbstractContainerScreen.class.getDeclaredFields()) {
+                    if (f.getType() == Slot.class && f.getName().toLowerCase().contains("hover")) {
+                        hoveredField = f;
+                        break;
+                    }
+                }
+                if (hoveredField == null) {
+                    hoveredLookupFailed = true;
+                    System.out.println("[HoverQuickMove] could not find the hovered-slot field");
+                    return null;
+                }
+                hoveredField.setAccessible(true);
+            }
+            return (Slot) hoveredField.get(screen);
+        } catch (Exception e) {
+            hoveredLookupFailed = true;
+            System.out.println("[HoverQuickMove] could not read the hovered slot: " + e);
+            return null;
+        }
     }
 
     private static int keyFromName(String name) {
